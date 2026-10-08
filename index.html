@@ -95,6 +95,18 @@ function setStatus(msg, cls) {
   statusEl.innerHTML = msg;
 }
 
+// Compact base58 encoder (wallet-standard signatures come back as raw
+// 64-byte Uint8Arrays). No extra dependency needed.
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+function base58Encode(bytes) {
+  let num = 0n;
+  for (let i = 0; i < bytes.length; i++) num = (num << 8n) | BigInt(bytes[i]);
+  let out = '';
+  while (num > 0n) { out = BASE58_ALPHABET[Number(num % 58n)] + out; num = num / 58n; }
+  for (let i = 0; i < bytes.length && bytes[i] === 0; i++) out = '1' + out;
+  return out;
+}
+
 // ---- RPC with fallback ------------------------------------------------
 // Public mainnet endpoints in priority order. If one fails a request
 // (rate-limit, 403, timeout), the same request is retried on the next
@@ -112,6 +124,27 @@ async function withRpcFallback(label, fn) {
     }
   }
   throw lastErr;
+}
+
+// Poll confirmation via page-RPC reads only. Transport failures are
+// swallowed — a failed poll must NEVER be reported as a failed
+// transaction. The chain is the source of truth; the signature +
+// Solscan link are shown instead. Only a genuine on-chain error throws.
+async function pollConfirmed(sig58, timeoutMs) {
+  const deadline = Date.now() + (timeoutMs || 25000);
+  while (Date.now() < deadline) {
+    try {
+      const res = await withRpcFallback('getSignatureStatuses', (c) => c.getSignatureStatuses([sig58]));
+      const st = res && res.value && res.value[0];
+      if (st && st.err) throw new Error('Transaction failed on-chain: ' + JSON.stringify(st.err));
+      if (st && (st.confirmationStatus === 'confirmed' || st.confirmationStatus === 'finalized')) return true;
+    } catch (e) {
+      if (e && e.message && e.message.indexOf('Transaction failed on-chain') === 0) throw e;
+      console.warn('confirmation poll attempt failed; retrying…', e);
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  return false;
 }
 
 // ---- wallet connection layer -------------------------------------------
@@ -175,6 +208,26 @@ class WalletStandardAdapter extends BaseWalletAdapter {
     const signed = await this.signTransaction(transaction);
     return await conn.sendRawTransaction(signed.serialize(), options);
   }
+  supportsSignAndSend() {
+    return !!(this._wallet.features && this._wallet.features['solana:signAndSendTransaction']);
+  }
+  // Preferred submission path: the wallet signs AND submits using its own
+  // Solana connection, returning the base58 signature. The page's public
+  // RPC endpoints 403 sendTransaction from some mobile clients, so this
+  // avoids them entirely.
+  async signAndSendTransaction(transaction) {
+    const feature = this._wallet.features && this._wallet.features['solana:signAndSendTransaction'];
+    if (!feature) throw new Error('This wallet does not support signAndSendTransaction.');
+    const outputs = await feature.signAndSendTransaction({
+      transaction: transaction.serialize({ requireAllSignatures: false }),
+      account: this._account,
+      chain: 'solana:mainnet',
+    });
+    const sigOut = outputs && outputs[0] && outputs[0].signature;
+    if (typeof sigOut === 'string' && sigOut.length >= 80) return sigOut;
+    if (sigOut && sigOut.length === 64) return base58Encode(sigOut);
+    throw new Error('Wallet did not return a transaction signature.');
+  }
   async signTransaction(transaction) {
     if (!this._publicKey) throw new Error('Wallet not connected.');
     const feature = this._wallet.features && this._wallet.features['solana:signTransaction'];
@@ -230,6 +283,19 @@ class InjectedProviderAdapter extends BaseWalletAdapter {
   async sendTransaction(transaction, conn, options) {
     const signed = await this.signTransaction(transaction);
     return await conn.sendRawTransaction(signed.serialize(), options);
+  }
+  supportsSignAndSend() {
+    return typeof this._provider.signAndSendTransaction === 'function';
+  }
+  async signAndSendTransaction(transaction) {
+    // Legacy providers (window.coinbaseSolana / window.solana) submit with
+    // their own connection and resolve to the base58 signature string.
+    const res = await this._provider.signAndSendTransaction(transaction);
+    if (typeof res === 'string' && res.length >= 80) return res;
+    const inner = res && res.signature;
+    if (typeof inner === 'string' && inner.length >= 80) return inner;
+    if (inner && inner.length === 64) return base58Encode(inner);
+    throw new Error('Wallet did not return a transaction signature.');
   }
   async signTransaction(transaction) {
     return await this._provider.signTransaction(transaction);
@@ -376,15 +442,38 @@ attachBtn.addEventListener('click', async () => {
       throw new Error('Safety check failed: transaction must contain exactly one instruction.');
     }
 
-    const signed = await adapter.signTransaction(tx);
-    const sig = await withRpcFallback('sendRawTransaction', (c) => c.sendRawTransaction(signed.serialize()));
-    setStatus('Sent. Confirming…<br><span class="mono">' + sig + '</span>', 'info');
-    await withRpcFallback('confirmTransaction', (c) => c.confirmTransaction(sig, 'confirmed'));
-    setStatus(
-      '<span class="check">✓</span> Metadata attached!<br>' +
-      '<a href="https://solscan.io/token/' + MINT + '" target="_blank" rel="noopener">View PROSP on Solscan</a>',
-      'ok'
-    );
+    // Submission: prefer wallet-side (the wallet signs AND submits with its
+    // own connection). The page's public RPC endpoints 403 sendTransaction
+    // from some mobile clients, so page-side submission is fallback only.
+    let sig58;
+    if (typeof adapter.supportsSignAndSend === 'function' && adapter.supportsSignAndSend()) {
+      sig58 = await adapter.signAndSendTransaction(tx);
+    } else {
+      const signed = await adapter.signTransaction(tx);
+      sig58 = await withRpcFallback('sendRawTransaction', (c) => c.sendRawTransaction(signed.serialize()));
+    }
+    setStatus('Sent. Confirming…<br><span class="mono">' + sig58 + '</span>', 'info');
+    const solscanTx = 'https://solscan.io/tx/' + sig58;
+    // pollConfirmed only throws on a genuine on-chain failure; transport
+    // problems return false and are shown as sent-with-signature, never
+    // as a failure.
+    const confirmed = await pollConfirmed(sig58);
+    if (confirmed) {
+      setStatus(
+        '<span class="check">✓</span> Metadata attached!<br>' +
+        '<a href="' + solscanTx + '" target="_blank" rel="noopener">View transaction on Solscan</a><br>' +
+        '<a href="https://solscan.io/token/' + MINT + '" target="_blank" rel="noopener">View PROSP on Solscan</a>',
+        'ok'
+      );
+    } else {
+      setStatus(
+        '<span class="check">✓</span> Transaction sent! Confirmation could not be polled over this network connection, ' +
+        'but the chain is the source of truth.<br>' +
+        'Signature: <span class="mono">' + sig58 + '</span><br>' +
+        '<a href="' + solscanTx + '" target="_blank" rel="noopener">Check it on Solscan</a>',
+        'ok'
+      );
+    }
   } catch (e) {
     const msg = (e && e.message ? e.message : String(e));
     setStatus('Failed: ' + msg, 'err');
