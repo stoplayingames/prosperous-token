@@ -77,7 +77,11 @@ const MINT_AUTHORITY = '6uH3hNDRgWfHp25XiAyzfKgFqdDNg4W23KJGn99jpCtP';
 const NAME = 'Prosperous';
 const SYMBOL = 'PROSP';
 const URI = 'https://cdn.jsdelivr.net/gh/stoplayingames/prosperous-token@main/metadata.json';
-const RPC = 'https://api.mainnet-beta.solana.com';
+const RPCS = [
+  'https://solana-rpc.publicnode.com',
+  'https://rpc.ankr.com/solana',
+  'https://api.mainnet-beta.solana.com',
+];
 const EXPECTED_PROGRAM_ID = 'metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s';
 // --------------------------------------------
 
@@ -91,7 +95,24 @@ function setStatus(msg, cls) {
   statusEl.innerHTML = msg;
 }
 
-const connection = new Connection(RPC, 'confirmed');
+// ---- RPC with fallback ------------------------------------------------
+// Public mainnet endpoints in priority order. If one fails a request
+// (rate-limit, 403, timeout), the same request is retried on the next
+// endpoint before any error reaches the user.
+const connections = RPCS.map((url) => new Connection(url, 'confirmed'));
+
+async function withRpcFallback(label, fn) {
+  let lastErr = null;
+  for (let i = 0; i < connections.length; i++) {
+    try {
+      return await fn(connections[i]);
+    } catch (e) {
+      lastErr = e;
+      console.warn('RPC ' + RPCS[i] + ' failed on ' + label + '; trying next…', e);
+    }
+  }
+  throw lastErr;
+}
 
 // ---- wallet connection layer -------------------------------------------
 // Primary: Wallet Standard detection (works with Coinbase Wallet's mobile
@@ -332,25 +353,33 @@ attachBtn.addEventListener('click', async () => {
       throw new Error('Safety check failed: unexpected program ID.');
     }
 
-    // 3. Idempotency: don't pay twice
+    // 3. Idempotency: don't pay twice. NOTE: this check is NON-FATAL —
+    //    an RPC/transport failure must never block the flow. The on-chain
+    //    program safely rejects a true duplicate, so worst case the user
+    //    pays a few cents of fee and nothing moves.
     const pda = getMetadataPda(MINT);
-    const existing = await connection.getAccountInfo(pda);
+    let existing = null;
+    try {
+      existing = await withRpcFallback('getAccountInfo', (c) => c.getAccountInfo(pda));
+    } catch (e) {
+      console.warn('Pre-flight metadata check failed (RPC transport); proceeding to signing anyway.', e);
+    }
     if (existing) {
       setStatus('Metadata is already attached to PROSP. Nothing to do. <span class="check">✓</span>', 'ok');
       return;
     }
 
     setStatus('Building transaction… check your wallet to approve.', 'info');
-    const { blockhash } = await connection.getLatestBlockhash();
+    const { blockhash } = await withRpcFallback('getLatestBlockhash', (c) => c.getLatestBlockhash());
     const tx = new Transaction({ recentBlockhash: blockhash, feePayer: adapter.publicKey }).add(ix);
     if (tx.instructions.length !== 1) {
       throw new Error('Safety check failed: transaction must contain exactly one instruction.');
     }
 
     const signed = await adapter.signTransaction(tx);
-    const sig = await connection.sendRawTransaction(signed.serialize());
+    const sig = await withRpcFallback('sendRawTransaction', (c) => c.sendRawTransaction(signed.serialize()));
     setStatus('Sent. Confirming…<br><span class="mono">' + sig + '</span>', 'info');
-    await connection.confirmTransaction(sig, 'confirmed');
+    await withRpcFallback('confirmTransaction', (c) => c.confirmTransaction(sig, 'confirmed'));
     setStatus(
       '<span class="check">✓</span> Metadata attached!<br>' +
       '<a href="https://solscan.io/token/' + MINT + '" target="_blank" rel="noopener">View PROSP on Solscan</a>',
