@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Attach PROSP Metadata</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px 20px 40px;
+    background: #0b0e14; color: #f2f4f8;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    max-width: 520px; margin-left: auto; margin-right: auto;
+  }
+  h1 { font-size: 22px; margin: 8px 0 4px; }
+  .sub { color: #9aa4b2; font-size: 14px; line-height: 1.5; margin: 0 0 20px; }
+  .card {
+    background: #141926; border: 1px solid #232c40; border-radius: 14px;
+    padding: 16px; margin-bottom: 14px; font-size: 14px; line-height: 1.55;
+  }
+  .card b { color: #ffd479; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; word-break: break-all; color: #9aa4b2; }
+  button {
+    display: block; width: 100%; padding: 15px; margin: 10px 0;
+    font-size: 16px; font-weight: 700; border: none; border-radius: 12px;
+    background: #2f6bff; color: #fff; cursor: pointer;
+  }
+  button:disabled { background: #2a3242; color: #6b7688; cursor: default; }
+  button.go { background: #b8860b; }
+  #status { font-size: 14px; line-height: 1.6; min-height: 22px; margin-top: 12px; }
+  #status.ok { color: #7ee2a8; }
+  #status.err { color: #ff9a9a; }
+  #status.info { color: #9aa4b2; }
+  a { color: #7aa2ff; }
+  .check { color: #7ee2a8; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "buffer": "https://esm.sh/buffer@6.0.3",
+    "@solana/web3.js": "https://esm.sh/@solana/web3.js@1.95.8",
+    "@solana/wallet-adapter-base": "https://esm.sh/@solana/wallet-adapter-base@0.9.28",
+    "@solana/wallet-adapter-coinbase": "https://esm.sh/@solana/wallet-adapter-coinbase@0.1.24"
+  }
+}
+</script>
+</head>
+<body>
+  <h1>Attach PROSP Metadata</h1>
+  <p class="sub">This gives your Prosperous (PROSP) token its name, symbol and logo in wallets and on trading screens. One signature, nothing else moves.</p>
+
+  <div class="card">
+    <b>What this does</b><br>
+    Creates <span class="check">one</span> metadata account for the PROSP mint.<br>
+    Cost: ~0.01 SOL rent, paid from your wallet.<br>
+    It does <b>not</b> move any tokens or send SOL anywhere.
+    <div class="mono" style="margin-top:8px">Mint: 9JGrYc79PHRubjcBLhMJowr2qsUHHPMhfEXtUt5wb7mQ</div>
+  </div>
+
+  <button id="connectBtn">Connect Wallet</button>
+  <button id="attachBtn" class="go" disabled>Attach PROSP Metadata</button>
+  <div id="status" class="info"></div>
+
+<script type="module">
+import { Buffer } from 'buffer';
+import { Connection, PublicKey, Transaction } from '@solana/web3.js';
+import { CoinbaseWalletAdapter } from '@solana/wallet-adapter-coinbase';
+import {
+  buildCreateMetadataInstruction,
+  getMetadataPda,
+  TOKEN_METADATA_PROGRAM_ID,
+} from './metadata-instruction.js';
+
+// ---- locked parameters (do not change) ----
+const MINT = '9JGrYc79PHRubjcBLhMJowr2qsUHHPMhfEXtUt5wb7mQ';
+const MINT_AUTHORITY = '6uH3hNDRgWfHp25XiAyzfKgFqdDNg4W23KJGn99jpCtP';
+const NAME = 'Prosperous';
+const SYMBOL = 'PROSP';
+const URI = 'https://cdn.jsdelivr.net/gh/stoplayingames/prosperous-token@main/metadata.json';
+const RPC = 'https://api.mainnet-beta.solana.com';
+const EXPECTED_PROGRAM_ID = 'metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s';
+// --------------------------------------------
+
+const $ = (id) => document.getElementById(id);
+const statusEl = $('status');
+const connectBtn = $('connectBtn');
+const attachBtn = $('attachBtn');
+
+function setStatus(msg, cls) {
+  statusEl.className = cls || 'info';
+  statusEl.innerHTML = msg;
+}
+
+const connection = new Connection(RPC, 'confirmed');
+const adapter = new CoinbaseWalletAdapter();
+let connected = false;
+
+adapter.on('connect', () => {
+  connected = true;
+  connectBtn.disabled = true;
+  connectBtn.textContent = 'Connected: ' + adapter.publicKey.toBase58().slice(0, 4) + '...' + adapter.publicKey.toBase58().slice(-4);
+  attachBtn.disabled = false;
+  setStatus('Wallet connected. Ready when you are.', 'ok');
+});
+adapter.on('disconnect', () => {
+  connected = false;
+  connectBtn.disabled = false;
+  connectBtn.textContent = 'Connect Wallet';
+  attachBtn.disabled = true;
+  setStatus('Wallet disconnected.', 'info');
+});
+adapter.on('error', (e) => {
+  setStatus('Wallet error: ' + (e && e.message ? e.message : e), 'err');
+});
+
+connectBtn.addEventListener('click', async () => {
+  setStatus('Opening wallet…', 'info');
+  try {
+    await adapter.connect();
+  } catch (e) {
+    setStatus('Could not connect: ' + (e && e.message ? e.message : e), 'err');
+  }
+});
+
+attachBtn.addEventListener('click', async () => {
+  if (!connected || !adapter.publicKey) {
+    setStatus('Connect your wallet first.', 'err');
+    return;
+  }
+  const me = adapter.publicKey.toBase58();
+  if (me !== MINT_AUTHORITY) {
+    setStatus('This wallet is not the PROSP mint authority.<br>Please connect the wallet that holds it.', 'err');
+    return;
+  }
+  attachBtn.disabled = true;
+  try {
+    // 1. Build the single instruction
+    const ix = buildCreateMetadataInstruction({
+      mint: MINT,
+      mintAuthority: me,
+      payer: me,
+      updateAuthority: me,
+      name: NAME,
+      symbol: SYMBOL,
+      uri: URI,
+    });
+
+    // 2. Hard safety checks: exactly one instruction, and it must target
+    //    the Metaplex Token Metadata program — nothing else.
+    if (ix.programId.toBase58() !== EXPECTED_PROGRAM_ID) {
+      throw new Error('Safety check failed: unexpected program ID.');
+    }
+
+    // 3. Idempotency: don't pay twice
+    const pda = getMetadataPda(MINT);
+    const existing = await connection.getAccountInfo(pda);
+    if (existing) {
+      setStatus('Metadata is already attached to PROSP. Nothing to do. <span class="check">✓</span>', 'ok');
+      return;
+    }
+
+    setStatus('Building transaction… check your wallet to approve.', 'info');
+    const { blockhash } = await connection.getLatestBlockhash();
+    const tx = new Transaction({ recentBlockhash: blockhash, feePayer: adapter.publicKey }).add(ix);
+    if (tx.instructions.length !== 1) {
+      throw new Error('Safety check failed: transaction must contain exactly one instruction.');
+    }
+
+    const signed = await adapter.signTransaction(tx);
+    const sig = await connection.sendRawTransaction(signed.serialize());
+    setStatus('Sent. Confirming…<br><span class="mono">' + sig + '</span>', 'info');
+    await connection.confirmTransaction(sig, 'confirmed');
+    setStatus(
+      '<span class="check">✓</span> Metadata attached!<br>' +
+      '<a href="https://solscan.io/token/' + MINT + '" target="_blank" rel="noopener">View PROSP on Solscan</a>',
+      'ok'
+    );
+  } catch (e) {
+    const msg = (e && e.message ? e.message : String(e));
+    setStatus('Failed: ' + msg, 'err');
+    attachBtn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
