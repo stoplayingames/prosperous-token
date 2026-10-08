@@ -40,7 +40,7 @@
     "buffer": "https://esm.sh/buffer@6.0.3",
     "@solana/web3.js": "https://esm.sh/@solana/web3.js@1.95.8",
     "@solana/wallet-adapter-base": "https://esm.sh/@solana/wallet-adapter-base@0.9.28",
-    "@solana/wallet-adapter-coinbase": "https://esm.sh/@solana/wallet-adapter-coinbase@0.1.24"
+    "@wallet-standard/app": "https://esm.sh/@wallet-standard/app@1.1.1"
   }
 }
 </script>
@@ -64,7 +64,7 @@
 <script type="module">
 import { Buffer } from 'buffer';
 import { Connection, PublicKey, Transaction } from '@solana/web3.js';
-import { CoinbaseWalletAdapter } from '@solana/wallet-adapter-coinbase';
+import { BaseWalletAdapter, WalletReadyState } from '@solana/wallet-adapter-base';
 import {
   buildCreateMetadataInstruction,
   getMetadataPda,
@@ -92,30 +92,211 @@ function setStatus(msg, cls) {
 }
 
 const connection = new Connection(RPC, 'confirmed');
-const adapter = new CoinbaseWalletAdapter();
+
+// ---- wallet connection layer -------------------------------------------
+// Primary: Wallet Standard detection (works with Coinbase Wallet's mobile
+// dApp browser and any other injected wallet-standard provider).
+// Fallback: legacy injected providers (window.coinbaseSolana / window.solana).
+// The old @solana/wallet-adapter-coinbase targets the desktop extension and
+// never reaches a ready state on mobile — it is intentionally not used.
+
+class WalletStandardAdapter extends BaseWalletAdapter {
+  constructor(wallet) {
+    super();
+    this._wallet = wallet;
+    this._account = null;
+    this._publicKey = null;
+    this._connecting = false;
+    try {
+      const events = wallet.features && wallet.features['standard:events'];
+      if (events && typeof events.on === 'function') {
+        events.on('change', (props) => {
+          if (props && props.accounts && props.accounts.length) this._setAccount(props.accounts[0]);
+        });
+      }
+    } catch (_) { /* non-fatal */ }
+  }
+  get name() { return (this._wallet && this._wallet.name) || 'Wallet'; }
+  get url() { return ''; }
+  get icon() { return (this._wallet && this._wallet.icon) || ''; }
+  get publicKey() { return this._publicKey; }
+  get connecting() { return this._connecting; }
+  get readyState() { return WalletReadyState.Installed; }
+  _setAccount(account) {
+    this._account = account || null;
+    this._publicKey = account ? new PublicKey(account.address) : null;
+  }
+  async connect() {
+    if (this._publicKey) return;
+    this._connecting = true;
+    try {
+      const feature = this._wallet.features && this._wallet.features['standard:connect'];
+      if (!feature) throw new Error('This wallet does not support connect.');
+      const result = await feature.connect({ silent: false });
+      const accounts = result && result.accounts;
+      if (!accounts || !accounts.length) throw new Error('Wallet returned no accounts.');
+      const sol = accounts.find((a) => a.chains && a.chains.some((c) => typeof c === 'string' && c.indexOf('solana:') === 0));
+      this._setAccount(sol || accounts[0]);
+      this.emit('connect', this._publicKey);
+    } finally {
+      this._connecting = false;
+    }
+  }
+  async disconnect() {
+    try {
+      const feature = this._wallet.features && this._wallet.features['standard:disconnect'];
+      if (feature) await feature.disconnect();
+    } catch (_) { /* non-fatal */ }
+    this._setAccount(null);
+    this.emit('disconnect');
+  }
+  async sendTransaction(transaction, conn, options) {
+    const signed = await this.signTransaction(transaction);
+    return await conn.sendRawTransaction(signed.serialize(), options);
+  }
+  async signTransaction(transaction) {
+    if (!this._publicKey) throw new Error('Wallet not connected.');
+    const feature = this._wallet.features && this._wallet.features['solana:signTransaction'];
+    if (!feature) throw new Error('This wallet does not support signing Solana transactions.');
+    const outputs = await feature.signTransaction({
+      transaction: transaction.serialize({ requireAllSignatures: false }),
+      account: this._account,
+      chain: 'solana:mainnet',
+    });
+    if (!outputs || !outputs.length || !outputs[0].signedTransaction) {
+      throw new Error('Wallet did not return a signed transaction.');
+    }
+    return Transaction.from(outputs[0].signedTransaction);
+  }
+  async signAllTransactions(transactions) {
+    const out = [];
+    for (const tx of transactions) out.push(await this.signTransaction(tx));
+    return out;
+  }
+}
+
+class InjectedProviderAdapter extends BaseWalletAdapter {
+  constructor(provider) {
+    super();
+    this._provider = provider;
+    this._publicKey = null;
+    this._connecting = false;
+  }
+  get name() { return 'Injected Wallet'; }
+  get url() { return ''; }
+  get icon() { return ''; }
+  get publicKey() { return this._publicKey; }
+  get connecting() { return this._connecting; }
+  get readyState() { return WalletReadyState.Installed; }
+  async connect() {
+    if (this._publicKey) return;
+    this._connecting = true;
+    try {
+      const res = await this._provider.connect();
+      const raw = (res && res.publicKey) || this._provider.publicKey;
+      if (!raw) throw new Error('Wallet returned no public key.');
+      this._publicKey = new PublicKey(raw.toString());
+      this.emit('connect', this._publicKey);
+    } finally {
+      this._connecting = false;
+    }
+  }
+  async disconnect() {
+    try { await this._provider.disconnect(); } catch (_) { /* non-fatal */ }
+    this._publicKey = null;
+    this.emit('disconnect');
+  }
+  async sendTransaction(transaction, conn, options) {
+    const signed = await this.signTransaction(transaction);
+    return await conn.sendRawTransaction(signed.serialize(), options);
+  }
+  async signTransaction(transaction) {
+    return await this._provider.signTransaction(transaction);
+  }
+  async signAllTransactions(transactions) {
+    if (typeof this._provider.signAllTransactions === 'function') {
+      return await this._provider.signAllTransactions(transactions);
+    }
+    const out = [];
+    for (const tx of transactions) out.push(await this.signTransaction(tx));
+    return out;
+  }
+}
+
+function isSolanaWallet(w) {
+  if (!w || !w.features) return false;
+  if (w.features['solana:signTransaction']) return true;
+  return Array.isArray(w.chains) && w.chains.some((c) => typeof c === 'string' && c.indexOf('solana:') === 0);
+}
+
+async function detectWallet() {
+  // 1. Wallet Standard — detects Coinbase Wallet's mobile dApp browser
+  //    and any other injected wallet-standard provider.
+  try {
+    const { getWallets } = await import('@wallet-standard/app');
+    const api = getWallets();
+    let found = api.get().filter(isSolanaWallet);
+    if (!found.length) {
+      // Wallets can register a beat after page load; wait briefly.
+      await new Promise((resolve) => {
+        const done = () => {
+          window.removeEventListener('wallet-standard:register-wallet', done);
+          resolve();
+        };
+        window.addEventListener('wallet-standard:register-wallet', done);
+        setTimeout(done, 1500);
+      });
+      found = api.get().filter(isSolanaWallet);
+    }
+    const pick = found.find((w) => /coinbase/i.test(w.name || '')) || found[0];
+    if (pick) return new WalletStandardAdapter(pick);
+  } catch (e) {
+    // fall through to legacy injection
+  }
+
+  // 2. Legacy injected provider (older Coinbase Wallet: window.coinbaseSolana).
+  const injected = window.coinbaseSolana || window.solana;
+  if (injected && typeof injected.connect === 'function' && typeof injected.signTransaction === 'function') {
+    return new InjectedProviderAdapter(injected);
+  }
+  return null;
+}
+// ---- end wallet connection layer ---------------------------------------
+
+let adapter = null;
 let connected = false;
 
-adapter.on('connect', () => {
-  connected = true;
-  connectBtn.disabled = true;
-  connectBtn.textContent = 'Connected: ' + adapter.publicKey.toBase58().slice(0, 4) + '...' + adapter.publicKey.toBase58().slice(-4);
-  attachBtn.disabled = false;
-  setStatus('Wallet connected. Ready when you are.', 'ok');
-});
-adapter.on('disconnect', () => {
-  connected = false;
-  connectBtn.disabled = false;
-  connectBtn.textContent = 'Connect Wallet';
-  attachBtn.disabled = true;
-  setStatus('Wallet disconnected.', 'info');
-});
-adapter.on('error', (e) => {
-  setStatus('Wallet error: ' + (e && e.message ? e.message : e), 'err');
-});
+function wireAdapter(a) {
+  a.on('connect', () => {
+    connected = true;
+    connectBtn.disabled = true;
+    connectBtn.textContent = 'Connected: ' + a.publicKey.toBase58().slice(0, 4) + '...' + a.publicKey.toBase58().slice(-4);
+    attachBtn.disabled = false;
+    setStatus('Wallet connected. Ready when you are.', 'ok');
+  });
+  a.on('disconnect', () => {
+    connected = false;
+    connectBtn.disabled = false;
+    connectBtn.textContent = 'Connect Wallet';
+    attachBtn.disabled = true;
+    setStatus('Wallet disconnected.', 'info');
+  });
+  a.on('error', (e) => {
+    setStatus('Wallet error: ' + (e && e.message ? e.message : e), 'err');
+  });
+}
 
 connectBtn.addEventListener('click', async () => {
-  setStatus('Opening wallet…', 'info');
+  if (connected && adapter) return;
+  setStatus('Looking for your wallet…', 'info');
   try {
+    adapter = await detectWallet();
+    if (!adapter) {
+      setStatus('No wallet found. Please open this page inside the Coinbase Wallet app browser and try again.', 'err');
+      return;
+    }
+    wireAdapter(adapter);
+    setStatus('Opening wallet…', 'info');
     await adapter.connect();
   } catch (e) {
     setStatus('Could not connect: ' + (e && e.message ? e.message : e), 'err');
