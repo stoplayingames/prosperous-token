@@ -177,14 +177,14 @@ async function connectWallet() {
   throw new Error('No compatible wallet found. Open this page in your Base App browser.');
 }
 
-// UpdateMetadataAccountV2: [15, 1, <32-byte new authority>, 0, 0, 0]
-// Sets new update authority, leaves data/primary_sale/is_mutable unchanged.
+// UpdateMetadataAccount (V1): [1, 1, <32-byte new authority>, 0, 0]
+// Sets new update authority, leaves data/primary_sale_happened unchanged.
 function buildTransferIx(newAuthorityPk) {
   const data = Buffer.concat([
-    Buffer.from([15]),
+    Buffer.from([1]),
     Buffer.from([1]),
     newAuthorityPk.toBuffer(),
-    Buffer.from([0, 0, 0]),
+    Buffer.from([0, 0]),
   ]);
   return new TransactionInstruction({
     programId: metaplexPk,
