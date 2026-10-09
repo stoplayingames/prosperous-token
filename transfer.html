@@ -70,6 +70,22 @@
   </div>
 
   <button id="connectBtn">Connect Wallet</button>
+  <div id="status" class="info">Loading page…</div>
+  <script>
+    // Non-module watchdog: proves the HTML is alive and reports module failures.
+    window.__moduleReady = false;
+    window.addEventListener('error', function (e) {
+      if (!window.__moduleReady) {
+        var el = document.getElementById('status');
+        if (el) {
+          el.className = 'err';
+          el.textContent = 'Page error: ' + (e.message || e.type || 'unknown') +
+            (e.filename ? ' (' + e.filename.split('/').pop() + ')' : '');
+        }
+      }
+    }, true);
+    document.getElementById('status').textContent = 'Page loaded. Tap Connect Wallet.';
+  </script>
 
   <div class="card" id="balanceCard" style="display:none">
     <b>Your PROSP balance:</b> <span id="balanceVal">…</span>
@@ -90,7 +106,6 @@
   </div>
 
   <button id="sendBtn" class="go" disabled>Send PROSP</button>
-  <div id="status" class="info"></div>
 
 <script type="module">
 import { Buffer } from 'buffer';
@@ -409,6 +424,7 @@ sendBtn.addEventListener('click', async () => {
   }
   refreshSendState();
 });
+window.__moduleReady = true;
 </script>
 </body>
 </html>
