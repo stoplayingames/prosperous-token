@@ -51,16 +51,15 @@
 {
   "imports": {
     "buffer": "https://esm.sh/buffer@6.0.3",
-    "@solana/web3.js": "https://esm.sh/@solana/web3.js@1.95.8",
-    "@solana/wallet-adapter-base": "https://esm.sh/@solana/wallet-adapter-base@0.9.28",
-    "@solana/wallet-adapter-coinbase": "https://esm.sh/@solana/wallet-adapter-coinbase@0.1.24"
+    "bs58": "https://esm.sh/bs58@5.0.0",
+    "@solana/web3.js": "https://esm.sh/@solana/web3.js@1.95.8"
   }
 }
 </script>
 </head>
 <body>
   <h1>Move PROSP to Phantom</h1>
-  <p class="sub">Sends your Prosperous (PROSP) tokens from your Base App wallet to your new Phantom address. One signature. Nothing else moves.</p>
+  <p class="sub">Sends your Prosperous (PROSP) tokens from your Base App wallet to your new Phantom address. One signature. Nothing else moves.<br><br><span class="warn">Tip:</span> open this page in your Base App's browser (globe icon) for the smoothest connection.</p>
 
   <div class="card">
     <b>What this does</b><br>
@@ -95,8 +94,8 @@
 
 <script type="module">
 import { Buffer } from 'buffer';
+import bs58 from 'bs58';
 import { Connection, PublicKey, Transaction, TransactionInstruction, SystemProgram } from '@solana/web3.js';
-import { CoinbaseWalletAdapter } from '@solana/wallet-adapter-coinbase';
 
 // ---- locked parameters (do not change) ----
 const MINT = '9JGrYc79PHRubjcBLhMJowr2qsUHHPMhfEXtUt5wb7mQ';
@@ -125,14 +124,14 @@ function setStatus(msg, cls) {
 }
 
 const connection = new Connection(RPC, 'confirmed');
-const adapter = new CoinbaseWalletAdapter();
 const mintPk = new PublicKey(MINT);
 const holderPk = new PublicKey(HOLDER);
 const tokenProgramPk = new PublicKey(TOKEN_PROGRAM_ID);
 const ataProgramPk = new PublicKey(ASSOCIATED_TOKEN_PROGRAM_ID);
 
-let connected = false;
-let balanceBaseUnits = 0n; // BigInt
+// Wallet handle: { kind: 'injected'|'standard', publicKey, signAndSend(tx) }
+let wallet = null;
+let balanceBaseUnits = 0n;
 let sourceATA = null;
 
 function shortAddr(a) { return a.slice(0, 6) + '…' + a.slice(-6); }
@@ -153,7 +152,6 @@ function formatUnits(bi) {
   return frac ? whole + '.' + frac : whole;
 }
 
-// Derive the associated token account address (same algorithm as @solana/spl-token).
 function findATA(ownerPk) {
   const [addr] = PublicKey.findProgramAddressSync(
     [ownerPk.toBuffer(), tokenProgramPk.toBuffer(), mintPk.toBuffer()],
@@ -179,7 +177,7 @@ function buildCreateATAIx(payer, ata, owner) {
 
 function buildTransferIx(source, dest, owner, amount) {
   const data = Buffer.alloc(9);
-  data[0] = 3; // Transfer instruction index
+  data[0] = 3;
   data.writeBigUInt64LE(amount, 1);
   return new TransactionInstruction({
     programId: tokenProgramPk,
@@ -192,7 +190,6 @@ function buildTransferIx(source, dest, owner, amount) {
   });
 }
 
-// Hard safety verification of the final transaction before signing.
 function verifyTransaction(tx, owner, expectedSourceATA, expectedDestATA, expectedAmount) {
   const ixs = tx.instructions;
   if (ixs.length < 1 || ixs.length > 2) throw new Error('Safety check failed: unexpected instruction count.');
@@ -221,15 +218,98 @@ function verifyTransaction(tx, owner, expectedSourceATA, expectedDestATA, expect
   if (transferCount !== 1) throw new Error('Safety check failed: expected exactly one transfer.');
 }
 
+// ---- wallet detection: injected provider first, then Wallet Standard ----
+function getStandardWallets() {
+  const out = [];
+  try {
+    const nav = window.navigator;
+    if (nav && Array.isArray(nav.wallets)) {
+      for (const w of nav.wallets) out.push(w);
+    }
+  } catch (e) { /* ignore */ }
+  for (const w of pendingStandardWallets) out.push(w);
+  return out;
+}
+const pendingStandardWallets = [];
+window.addEventListener('wallet-standard:register-wallet', (e) => {
+  try {
+    const w = typeof e.detail === 'function' ? e.detail() : e.detail;
+    if (w) pendingStandardWallets.push(w);
+  } catch (err) { /* ignore */ }
+});
+window.addEventListener('wallet-standard:app-ready', () => { /* registry warmed */ });
+
+async function connectWallet() {
+  // 1. Injected provider (e.g. window.coinbaseSolana)
+  const injected = window.coinbaseSolana;
+  if (injected) {
+    await injected.connect();
+    if (!injected.publicKey) throw new Error('Wallet did not return an address.');
+    const pk = new PublicKey(injected.publicKey.toBytes());
+    return {
+      kind: 'injected',
+      publicKey: pk,
+      label: 'injected wallet',
+      signAndSend: async (tx) => {
+        const res = await injected.signAndSendTransaction(tx);
+        const sig = res && res.signature ? res.signature : res;
+        return typeof sig === 'string' ? sig : bs58.encode(sig);
+      },
+    };
+  }
+
+  // 2. Wallet Standard registry — look for the Coinbase / Base wallet
+  // Give late-registering wallets a moment to appear.
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const wallets = getStandardWallets();
+    const match =
+      wallets.find((w) => /coinbase/i.test(w.name || '')) ||
+      wallets.find((w) => /base/i.test(w.name || ''));
+    if (match) {
+      const connectFeature = match.features && match.features['standard:connect'];
+      const sendFeature = match.features && match.features['solana:signAndSendTransaction'];
+      if (!connectFeature) throw new Error('Wallet does not support connecting.');
+      if (!sendFeature) throw new Error('Wallet does not support sending transactions.');
+      await connectFeature.connect();
+      const acct =
+        (match.accounts || []).find((a) => (a.chains || []).includes('solana:mainnet')) ||
+        (match.accounts || [])[0];
+      if (!acct) throw new Error('Wallet returned no accounts.');
+      const pk = new PublicKey(acct.address);
+      return {
+        kind: 'standard',
+        publicKey: pk,
+        label: match.name || 'wallet',
+        signAndSend: async (tx) => {
+          const txBytes = tx.serialize({ requireAllSignatures: false, verifySignatures: false });
+          const out = await sendFeature.signAndSendTransaction({
+            transaction: txBytes,
+            account: acct,
+            chain: 'solana:mainnet',
+          });
+          const raw = Array.isArray(out) ? out[0].signature : out.signature;
+          const bytes = typeof raw === 'string' ? bs58.decode(raw) : raw;
+          return bs58.encode(bytes);
+        },
+      };
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  throw new Error(
+    'No compatible wallet found on this page. Open this page in your Base App browser (globe icon) and try again.'
+  );
+}
+
 function refreshSendState() {
-  let ok = connected;
+  const ready = !!wallet;
   let destOk = false;
   try {
     const d = new PublicKey(destInput.value.trim());
     destOk = !d.equals(holderPk);
     if (destOk) {
       destCheck.style.display = 'block';
-      destCheck.textContent = 'Sending to: ' + destInput.value.trim() + '\nCheck: starts ' + destInput.value.trim().slice(0, 4) + ' … ends ' + destInput.value.trim().slice(-4);
+      const v = destInput.value.trim();
+      destCheck.textContent = 'Sending to: ' + v + '\nCheck: starts ' + v.slice(0, 4) + ' … ends ' + v.slice(-4);
     } else {
       destCheck.style.display = 'none';
     }
@@ -241,20 +321,26 @@ function refreshSendState() {
     const a = parseUnits(amountInput.value);
     amountOk = a > 0n && a <= balanceBaseUnits;
   } catch (e) { /* invalid */ }
-  sendBtn.disabled = !(ok && destOk && verifyBox.checked && amountOk);
+  sendBtn.disabled = !(ready && destOk && verifyBox.checked && amountOk);
 }
 
-adapter.on('connect', async () => {
-  connected = true;
-  const me = adapter.publicKey.toBase58();
+connectBtn.addEventListener('click', async () => {
+  setStatus('Looking for your wallet…', 'info');
   connectBtn.disabled = true;
-  connectBtn.textContent = 'Connected: ' + shortAddr(me);
-  if (me !== HOLDER) {
-    setStatus('This is not the wallet holding PROSP.<br>Please connect the Base App wallet.', 'err');
-    return;
-  }
   try {
-    sourceATA = findATA(adapter.publicKey);
+    const w = await connectWallet();
+    if (!w.publicKey.equals(holderPk)) {
+      setStatus(
+        'Connected to ' + shortAddr(w.publicKey.toBase58()) + ' (' + w.label + '), but PROSP lives at ' +
+        shortAddr(HOLDER) + '.<br>Please connect the Base App wallet that holds PROSP.',
+        'err'
+      );
+      connectBtn.disabled = false;
+      return;
+    }
+    wallet = w;
+    connectBtn.textContent = 'Connected: ' + shortAddr(w.publicKey.toBase58());
+    sourceATA = findATA(w.publicKey);
     const bal = await connection.getTokenAccountBalance(sourceATA);
     balanceBaseUnits = BigInt(bal.value.amount);
     balanceCard.style.display = 'block';
@@ -264,32 +350,13 @@ adapter.on('connect', async () => {
       setStatus('This wallet holds 0 PROSP. Nothing to send.', 'err');
       return;
     }
-    setStatus('Wallet connected. Enter the destination and amount.', 'ok');
+    setStatus('Wallet connected (' + w.label + '). Enter the destination and amount.', 'ok');
   } catch (e) {
-    setStatus('Could not read PROSP balance: ' + (e && e.message ? e.message : e), 'err');
+    setStatus('Could not connect: ' + (e && e.message ? e.message : e), 'err');
+    connectBtn.disabled = false;
     return;
   }
   refreshSendState();
-});
-adapter.on('disconnect', () => {
-  connected = false;
-  connectBtn.disabled = false;
-  connectBtn.textContent = 'Connect Wallet';
-  sendBtn.disabled = true;
-  balanceCard.style.display = 'none';
-  setStatus('Wallet disconnected.', 'info');
-});
-adapter.on('error', (e) => {
-  setStatus('Wallet error: ' + (e && e.message ? e.message : e), 'err');
-});
-
-connectBtn.addEventListener('click', async () => {
-  setStatus('Opening wallet…', 'info');
-  try {
-    await adapter.connect();
-  } catch (e) {
-    setStatus('Could not connect: ' + (e && e.message ? e.message : e), 'err');
-  }
 });
 
 destInput.addEventListener('input', refreshSendState);
@@ -303,7 +370,7 @@ maxBtn.addEventListener('click', () => {
 sendBtn.addEventListener('click', async () => {
   sendBtn.disabled = true;
   try {
-    const owner = adapter.publicKey;
+    const owner = wallet.publicKey;
     const destOwner = new PublicKey(destInput.value.trim());
     const amount = parseUnits(amountInput.value);
     if (amount <= 0n || amount > balanceBaseUnits) throw new Error('Invalid amount.');
@@ -324,8 +391,7 @@ sendBtn.addEventListener('click', async () => {
     // Hard safety checks before signing.
     verifyTransaction(tx, owner, sourceATA, destATA, amount);
 
-    const signed = await adapter.signTransaction(tx);
-    const sig = await connection.sendRawTransaction(signed.serialize());
+    const sig = await wallet.signAndSend(tx);
     setStatus('Sent. Confirming…<br><span class="mono">' + sig + '</span>', 'info');
     await connection.confirmTransaction(sig, 'confirmed');
     setStatus(
@@ -333,7 +399,6 @@ sendBtn.addEventListener('click', async () => {
       '<a href="https://solscan.io/tx/' + sig + '" target="_blank" rel="noopener">View transaction on Solscan</a>',
       'ok'
     );
-    // Refresh balance
     const bal = await connection.getTokenAccountBalance(sourceATA);
     balanceBaseUnits = BigInt(bal.value.amount);
     balanceVal.textContent = formatUnits(balanceBaseUnits) + ' PROSP';
