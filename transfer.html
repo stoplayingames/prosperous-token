@@ -152,6 +152,22 @@ const ataProgramPk = new PublicKey(ASSOCIATED_TOKEN_PROGRAM_ID);
 
 // Wallet handle: { kind: 'injected'|'standard', publicKey, signAndSend(tx) }
 let wallet = null;
+
+// Balance read that tries each RPC in turn. Returns null if all refuse.
+async function fetchBalance() {
+  const endpoints = [
+    'https://solana-rpc.publicnode.com',
+    'https://api.mainnet-beta.solana.com',
+  ];
+  for (const url of endpoints) {
+    try {
+      const conn = new Connection(url, 'confirmed');
+      const bal = await conn.getTokenAccountBalance(sourceATA);
+      return BigInt(bal.value.amount);
+    } catch (e) { /* try next endpoint */ }
+  }
+  return null;
+}
 // Last verified on-chain balance: 1,000,000,000 PROSP (checked 2026-10-09).
 // Refreshed best-effort after connect; sends are subtracted locally.
 let balanceBaseUnits = 1000000000n * 1000000000n;
@@ -372,10 +388,8 @@ connectBtn.addEventListener('click', async () => {
     connectBtn.textContent = 'Connected: ' + shortAddr(w.publicKey.toBase58());
     sourceATA = findATA(w.publicKey);
     // Best-effort balance refresh — a blocked RPC never stops the transfer.
-    try {
-      const bal = await connection.getTokenAccountBalance(sourceATA);
-      balanceBaseUnits = BigInt(bal.value.amount);
-    } catch (e) { /* keep last verified balance */ }
+    const refreshed = await fetchBalance();
+    if (refreshed !== null) balanceBaseUnits = refreshed;
     balanceCard.style.display = 'block';
     balanceVal.textContent = formatUnits(balanceBaseUnits) + ' PROSP';
     amountInput.value = formatUnits(balanceBaseUnits);
@@ -438,12 +452,8 @@ sendBtn.addEventListener('click', async () => {
       'ok'
     );
     // Refresh balance: best-effort RPC, otherwise track locally.
-    try {
-      const bal = await connection.getTokenAccountBalance(sourceATA);
-      balanceBaseUnits = BigInt(bal.value.amount);
-    } catch (e) {
-      balanceBaseUnits -= amount;
-    }
+    const refreshedBal = await fetchBalance();
+    balanceBaseUnits = refreshedBal !== null ? refreshedBal : balanceBaseUnits - amount;
     balanceVal.textContent = formatUnits(balanceBaseUnits) + ' PROSP';
     amountInput.value = formatUnits(balanceBaseUnits);
   } catch (e) {
