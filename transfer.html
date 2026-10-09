@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Move PROSP to Phantom</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px 20px 40px;
+    background: #0b0e14; color: #f2f4f8;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    max-width: 520px; margin-left: auto; margin-right: auto;
+  }
+  h1 { font-size: 22px; margin: 8px 0 4px; }
+  .sub { color: #9aa4b2; font-size: 14px; line-height: 1.5; margin: 0 0 20px; }
+  .card {
+    background: #141926; border: 1px solid #232c40; border-radius: 14px;
+    padding: 16px; margin-bottom: 14px; font-size: 14px; line-height: 1.55;
+  }
+  .card b { color: #ffd479; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; word-break: break-all; color: #9aa4b2; }
+  .addr-check { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; word-break: break-all; color: #7ee2a8; background: #0e1420; border: 1px solid #232c40; border-radius: 10px; padding: 10px 12px; margin-top: 8px; }
+  label { display: block; font-size: 13px; color: #9aa4b2; margin: 14px 0 6px; }
+  input[type=text], input[type=number] {
+    width: 100%; padding: 13px 12px; font-size: 15px; border-radius: 12px;
+    border: 1px solid #232c40; background: #0e1420; color: #f2f4f8;
+  }
+  input:focus { outline: none; border-color: #2f6bff; }
+  .row { display: flex; gap: 10px; align-items: center; }
+  .row input { flex: 1; }
+  .maxbtn { flex: 0 0 auto; width: auto; padding: 13px 16px; margin: 0; font-size: 14px; }
+  .verify { display: flex; gap: 10px; align-items: flex-start; margin-top: 14px; font-size: 13px; color: #c6cdd8; line-height: 1.5; }
+  .verify input { margin-top: 3px; width: 18px; height: 18px; flex: 0 0 auto; }
+  button {
+    display: block; width: 100%; padding: 15px; margin: 10px 0;
+    font-size: 16px; font-weight: 700; border: none; border-radius: 12px;
+    background: #2f6bff; color: #fff; cursor: pointer;
+  }
+  button:disabled { background: #2a3242; color: #6b7688; cursor: default; }
+  button.go { background: #b8860b; }
+  #status { font-size: 14px; line-height: 1.6; min-height: 22px; margin-top: 12px; }
+  #status.ok { color: #7ee2a8; }
+  #status.err { color: #ff9a9a; }
+  #status.info { color: #9aa4b2; }
+  a { color: #7aa2ff; }
+  .check { color: #7ee2a8; }
+  .warn { color: #ffd479; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "buffer": "https://esm.sh/buffer@6.0.3",
+    "@solana/web3.js": "https://esm.sh/@solana/web3.js@1.95.8",
+    "@solana/wallet-adapter-base": "https://esm.sh/@solana/wallet-adapter-base@0.9.28",
+    "@solana/wallet-adapter-coinbase": "https://esm.sh/@solana/wallet-adapter-coinbase@0.1.24"
+  }
+}
+</script>
+</head>
+<body>
+  <h1>Move PROSP to Phantom</h1>
+  <p class="sub">Sends your Prosperous (PROSP) tokens from your Base App wallet to your new Phantom address. One signature. Nothing else moves.</p>
+
+  <div class="card">
+    <b>What this does</b><br>
+    Transfers PROSP from <span class="mono">6uH3…pCtP</span> (Base App) to the Phantom address you paste below.<br>
+    Cost: a tiny network fee plus ~0.002 SOL one-time rent for the new token account, paid from your wallet.<br>
+    <span class="warn">Tip:</span> send 1 PROSP first as a test, then the rest.
+    <div class="mono" style="margin-top:8px">Mint: 9JGrYc79PHRubjcBLhMJowr2qsUHHPMhfEXtUt5wb7mQ</div>
+  </div>
+
+  <button id="connectBtn">Connect Wallet</button>
+
+  <div class="card" id="balanceCard" style="display:none">
+    <b>Your PROSP balance:</b> <span id="balanceVal">…</span>
+  </div>
+
+  <label for="destInput">Destination — your new Phantom Solana address</label>
+  <input type="text" id="destInput" placeholder="Paste your Phantom address" autocomplete="off" spellcheck="false">
+  <div class="addr-check" id="destCheck" style="display:none"></div>
+  <div class="verify">
+    <input type="checkbox" id="verifyBox">
+    <span>I compared the first and last characters above with my Phantom address and they match.</span>
+  </div>
+
+  <label for="amountInput">Amount of PROSP to send</label>
+  <div class="row">
+    <input type="text" id="amountInput" placeholder="0" inputmode="decimal" autocomplete="off">
+    <button class="maxbtn" id="maxBtn" type="button">Max</button>
+  </div>
+
+  <button id="sendBtn" class="go" disabled>Send PROSP</button>
+  <div id="status" class="info"></div>
+
+<script type="module">
+import { Buffer } from 'buffer';
+import { Connection, PublicKey, Transaction, TransactionInstruction, SystemProgram } from '@solana/web3.js';
+import { CoinbaseWalletAdapter } from '@solana/wallet-adapter-coinbase';
+
+// ---- locked parameters (do not change) ----
+const MINT = '9JGrYc79PHRubjcBLhMJowr2qsUHHPMhfEXtUt5wb7mQ';
+const HOLDER = '6uH3hNDRgWfHp25XiAyzfKgFqdDNg4W23KJGn99jpCtP';
+const DECIMALS = 9;
+const RPC = 'https://api.mainnet-beta.solana.com';
+const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+const ASSOCIATED_TOKEN_PROGRAM_ID = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8e';
+// --------------------------------------------
+
+const $ = (id) => document.getElementById(id);
+const statusEl = $('status');
+const connectBtn = $('connectBtn');
+const sendBtn = $('sendBtn');
+const destInput = $('destInput');
+const destCheck = $('destCheck');
+const verifyBox = $('verifyBox');
+const amountInput = $('amountInput');
+const maxBtn = $('maxBtn');
+const balanceCard = $('balanceCard');
+const balanceVal = $('balanceVal');
+
+function setStatus(msg, cls) {
+  statusEl.className = cls || 'info';
+  statusEl.innerHTML = msg;
+}
+
+const connection = new Connection(RPC, 'confirmed');
+const adapter = new CoinbaseWalletAdapter();
+const mintPk = new PublicKey(MINT);
+const holderPk = new PublicKey(HOLDER);
+const tokenProgramPk = new PublicKey(TOKEN_PROGRAM_ID);
+const ataProgramPk = new PublicKey(ASSOCIATED_TOKEN_PROGRAM_ID);
+
+let connected = false;
+let balanceBaseUnits = 0n; // BigInt
+let sourceATA = null;
+
+function shortAddr(a) { return a.slice(0, 6) + '…' + a.slice(-6); }
+
+function parseUnits(s) {
+  s = (s || '').trim();
+  if (!/^\d+(\.\d{1,9})?$/.test(s)) throw new Error('Enter a valid amount (up to 9 decimals).');
+  const parts = s.split('.');
+  const whole = parts[0];
+  const frac = (parts[1] || '').padEnd(9, '0').slice(0, 9);
+  return BigInt(whole) * (10n ** 9n) + BigInt(frac || '0');
+}
+
+function formatUnits(bi) {
+  const s = bi.toString().padStart(10, '0');
+  const whole = s.slice(0, -9) || '0';
+  const frac = s.slice(-9).replace(/0+$/, '');
+  return frac ? whole + '.' + frac : whole;
+}
+
+// Derive the associated token account address (same algorithm as @solana/spl-token).
+function findATA(ownerPk) {
+  const [addr] = PublicKey.findProgramAddressSync(
+    [ownerPk.toBuffer(), tokenProgramPk.toBuffer(), mintPk.toBuffer()],
+    ataProgramPk
+  );
+  return addr;
+}
+
+function buildCreateATAIx(payer, ata, owner) {
+  return new TransactionInstruction({
+    programId: ataProgramPk,
+    keys: [
+      { pubkey: payer, isSigner: true, isWritable: true },
+      { pubkey: ata, isSigner: false, isWritable: true },
+      { pubkey: owner, isSigner: false, isWritable: false },
+      { pubkey: mintPk, isSigner: false, isWritable: false },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      { pubkey: tokenProgramPk, isSigner: false, isWritable: false },
+    ],
+    data: Buffer.alloc(0),
+  });
+}
+
+function buildTransferIx(source, dest, owner, amount) {
+  const data = Buffer.alloc(9);
+  data[0] = 3; // Transfer instruction index
+  data.writeBigUInt64LE(amount, 1);
+  return new TransactionInstruction({
+    programId: tokenProgramPk,
+    keys: [
+      { pubkey: source, isSigner: false, isWritable: true },
+      { pubkey: dest, isSigner: false, isWritable: true },
+      { pubkey: owner, isSigner: true, isWritable: false },
+    ],
+    data,
+  });
+}
+
+// Hard safety verification of the final transaction before signing.
+function verifyTransaction(tx, owner, expectedSourceATA, expectedDestATA, expectedAmount) {
+  const ixs = tx.instructions;
+  if (ixs.length < 1 || ixs.length > 2) throw new Error('Safety check failed: unexpected instruction count.');
+  let transferCount = 0;
+  for (const ix of ixs) {
+    const pid = ix.programId.toBase58();
+    if (pid === ASSOCIATED_TOKEN_PROGRAM_ID) {
+      if (ix.data.length !== 0) throw new Error('Safety check failed: malformed ATA instruction.');
+      const k = ix.keys.map((x) => x.pubkey.toBase58());
+      if (k[1] !== expectedDestATA.toBase58() || k[2] !== owner.toBase58() || k[3] !== MINT) {
+        throw new Error('Safety check failed: ATA instruction targets wrong account.');
+      }
+    } else if (pid === TOKEN_PROGRAM_ID) {
+      if (ix.data.length !== 9 || ix.data[0] !== 3) throw new Error('Safety check failed: not a token transfer.');
+      const amt = ix.data.readBigUInt64LE(1);
+      const k = ix.keys.map((x) => x.pubkey.toBase58());
+      if (k[0] !== expectedSourceATA.toBase58() || k[1] !== expectedDestATA.toBase58() || k[2] !== owner.toBase58()) {
+        throw new Error('Safety check failed: transfer involves wrong accounts.');
+      }
+      if (amt !== expectedAmount) throw new Error('Safety check failed: transfer amount mismatch.');
+      transferCount++;
+    } else {
+      throw new Error('Safety check failed: unexpected program ' + pid);
+    }
+  }
+  if (transferCount !== 1) throw new Error('Safety check failed: expected exactly one transfer.');
+}
+
+function refreshSendState() {
+  let ok = connected;
+  let destOk = false;
+  try {
+    const d = new PublicKey(destInput.value.trim());
+    destOk = !d.equals(holderPk);
+    if (destOk) {
+      destCheck.style.display = 'block';
+      destCheck.textContent = 'Sending to: ' + destInput.value.trim() + '\nCheck: starts ' + destInput.value.trim().slice(0, 4) + ' … ends ' + destInput.value.trim().slice(-4);
+    } else {
+      destCheck.style.display = 'none';
+    }
+  } catch (e) {
+    destCheck.style.display = 'none';
+  }
+  let amountOk = false;
+  try {
+    const a = parseUnits(amountInput.value);
+    amountOk = a > 0n && a <= balanceBaseUnits;
+  } catch (e) { /* invalid */ }
+  sendBtn.disabled = !(ok && destOk && verifyBox.checked && amountOk);
+}
+
+adapter.on('connect', async () => {
+  connected = true;
+  const me = adapter.publicKey.toBase58();
+  connectBtn.disabled = true;
+  connectBtn.textContent = 'Connected: ' + shortAddr(me);
+  if (me !== HOLDER) {
+    setStatus('This is not the wallet holding PROSP.<br>Please connect the Base App wallet.', 'err');
+    return;
+  }
+  try {
+    sourceATA = findATA(adapter.publicKey);
+    const bal = await connection.getTokenAccountBalance(sourceATA);
+    balanceBaseUnits = BigInt(bal.value.amount);
+    balanceCard.style.display = 'block';
+    balanceVal.textContent = formatUnits(balanceBaseUnits) + ' PROSP';
+    amountInput.value = formatUnits(balanceBaseUnits);
+    if (balanceBaseUnits === 0n) {
+      setStatus('This wallet holds 0 PROSP. Nothing to send.', 'err');
+      return;
+    }
+    setStatus('Wallet connected. Enter the destination and amount.', 'ok');
+  } catch (e) {
+    setStatus('Could not read PROSP balance: ' + (e && e.message ? e.message : e), 'err');
+    return;
+  }
+  refreshSendState();
+});
+adapter.on('disconnect', () => {
+  connected = false;
+  connectBtn.disabled = false;
+  connectBtn.textContent = 'Connect Wallet';
+  sendBtn.disabled = true;
+  balanceCard.style.display = 'none';
+  setStatus('Wallet disconnected.', 'info');
+});
+adapter.on('error', (e) => {
+  setStatus('Wallet error: ' + (e && e.message ? e.message : e), 'err');
+});
+
+connectBtn.addEventListener('click', async () => {
+  setStatus('Opening wallet…', 'info');
+  try {
+    await adapter.connect();
+  } catch (e) {
+    setStatus('Could not connect: ' + (e && e.message ? e.message : e), 'err');
+  }
+});
+
+destInput.addEventListener('input', refreshSendState);
+verifyBox.addEventListener('change', refreshSendState);
+amountInput.addEventListener('input', refreshSendState);
+maxBtn.addEventListener('click', () => {
+  amountInput.value = formatUnits(balanceBaseUnits);
+  refreshSendState();
+});
+
+sendBtn.addEventListener('click', async () => {
+  sendBtn.disabled = true;
+  try {
+    const owner = adapter.publicKey;
+    const destOwner = new PublicKey(destInput.value.trim());
+    const amount = parseUnits(amountInput.value);
+    if (amount <= 0n || amount > balanceBaseUnits) throw new Error('Invalid amount.');
+
+    const destATA = findATA(destOwner);
+    const ixs = [];
+    const destInfo = await connection.getAccountInfo(destATA);
+    if (!destInfo) {
+      ixs.push(buildCreateATAIx(owner, destATA, destOwner));
+    }
+    ixs.push(buildTransferIx(sourceATA, destATA, owner, amount));
+
+    setStatus('Building transaction… check your wallet to approve.', 'info');
+    const { blockhash } = await connection.getLatestBlockhash();
+    const tx = new Transaction({ recentBlockhash: blockhash, feePayer: owner });
+    ixs.forEach((ix) => tx.add(ix));
+
+    // Hard safety checks before signing.
+    verifyTransaction(tx, owner, sourceATA, destATA, amount);
+
+    const signed = await adapter.signTransaction(tx);
+    const sig = await connection.sendRawTransaction(signed.serialize());
+    setStatus('Sent. Confirming…<br><span class="mono">' + sig + '</span>', 'info');
+    await connection.confirmTransaction(sig, 'confirmed');
+    setStatus(
+      '<span class="check">✓</span> Sent ' + formatUnits(amount) + ' PROSP!<br>' +
+      '<a href="https://solscan.io/tx/' + sig + '" target="_blank" rel="noopener">View transaction on Solscan</a>',
+      'ok'
+    );
+    // Refresh balance
+    const bal = await connection.getTokenAccountBalance(sourceATA);
+    balanceBaseUnits = BigInt(bal.value.amount);
+    balanceVal.textContent = formatUnits(balanceBaseUnits) + ' PROSP';
+    amountInput.value = formatUnits(balanceBaseUnits);
+  } catch (e) {
+    const msg = (e && e.message ? e.message : String(e));
+    setStatus('Failed: ' + msg, 'err');
+  }
+  refreshSendState();
+});
+</script>
+</body>
+</html>
