@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Lock PROSP Supply — Revoke Mint Authority</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px 20px 40px;
+    background: #0b0e14; color: #f2f4f8;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    max-width: 520px; margin-left: auto; margin-right: auto;
+  }
+  h1 { font-size: 22px; margin: 8px 0 4px; }
+  .sub { color: #9aa4b2; font-size: 14px; line-height: 1.5; margin: 0 0 20px; }
+  .card {
+    background: #141926; border: 1px solid #232c40; border-radius: 14px;
+    padding: 16px; margin-bottom: 14px; font-size: 14px; line-height: 1.55;
+  }
+  .card b { color: #ffd479; }
+  .warn {
+    background: #2a1414; border: 1px solid #7a2e2e; border-radius: 14px;
+    padding: 16px; margin-bottom: 14px; font-size: 14px; line-height: 1.55;
+  }
+  .warn b { color: #ff9a9a; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; word-break: break-all; color: #9aa4b2; }
+  button {
+    width: 100%; padding: 15px; font-size: 16px; font-weight: 700;
+    border: none; border-radius: 14px; cursor: pointer; margin-top: 6px;
+  }
+  #connectBtn { background: #2b3450; color: #fff; }
+  #connectBtn:disabled { opacity: 0.55; }
+  #revokeBtn { background: #b3261e; color: #fff; }
+  #revokeBtn:disabled { opacity: 0.4; }
+  #status { margin-top: 12px; font-size: 14px; line-height: 1.5; min-height: 22px; }
+  #status.ok { color: #7ee2a8; }
+  #status.err { color: #ff9a9a; }
+  #status.info { color: #9aa4b2; }
+  #status .check { color: #7ee2a8; font-weight: 700; }
+  #status a { color: #7eb8ff; }
+  label.row { display: flex; gap: 10px; align-items: flex-start; font-size: 14px; color: #cfd6e4; margin: 14px 0; cursor: pointer; }
+  input[type="checkbox"] { width: 22px; height: 22px; margin-top: 2px; flex-shrink: 0; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "buffer": "https://esm.sh/buffer@6.0.3",
+    "bs58": "https://esm.sh/bs58@5.0.0",
+    "@solana/web3.js": "https://esm.sh/@solana/web3.js@1.95.8",
+    "@wallet-standard/app": "https://esm.sh/@wallet-standard/app@1.1.1"
+  }
+}
+</script>
+</head>
+<body>
+  <h1>Lock PROSP Supply</h1>
+  <p class="sub">Permanently revokes the mint authority on the Prosperous token. After this, no new PROSP can ever be created. One signature.</p>
+
+  <div class="warn">
+    <b>⚠️ Irreversible.</b> This permanently disables minting. The 1,000,000,000 PROSP supply becomes fixed forever. Burning (reducing supply) still works — only creation is disabled.
+    <div class="mono" style="margin-top:8px">Mint: 9JGrYc79PHRubjcBLhMJowr2qsUHHPMhfEXtUt5wb7mQ</div>
+  </div>
+
+  <button id="connectBtn">Connect Wallet</button>
+  <div id="status" class="info">Loading page…</div>
+  <script>
+    window.__moduleReady = false;
+    window.addEventListener('error', function (e) {
+      if (!window.__moduleReady) {
+        var el = document.getElementById('status');
+        if (el) {
+          el.className = 'err';
+          el.textContent = 'Page error: ' + (e.message || e.type || 'unknown') +
+            (e.filename ? ' (' + e.filename.split('/').pop() + ')' : '');
+        }
+      }
+    }, true);
+    document.getElementById('status').textContent = 'Page loaded. Tap Connect Wallet.';
+  </script>
+
+  <div id="revokeSection" style="display:none">
+    <label class="row">
+      <input type="checkbox" id="confirmBox">
+      <span>I understand this <b>permanently</b> disables creating new PROSP and cannot be undone.</span>
+    </label>
+    <button id="revokeBtn" disabled>Revoke Mint Authority</button>
+  </div>
+
+<script type="module">
+import { Buffer } from 'buffer';
+import bs58 from 'bs58';
+import {
+  Connection, PublicKey, Transaction, TransactionInstruction,
+  SystemProgram,
+} from '@solana/web3.js';
+
+window.Buffer = Buffer;
+
+const MINT = '9JGrYc79PHRubjcBLhMJowr2qsUHHPMhfEXtUt5wb7mQ';
+const EXPECTED_AUTHORITY = '6uH3hNDRgWfHp25XiAyzfKgFqdDNg4W23KJGn99jpCtP'; // Base App wallet
+const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+const RPC = 'https://solana-rpc.publicnode.com';
+
+const mintPk = new PublicKey(MINT);
+const authorityPk = new PublicKey(EXPECTED_AUTHORITY);
+const tokenProgramPk = new PublicKey(TOKEN_PROGRAM_ID);
+const connection = new Connection(RPC, 'confirmed');
+
+const $ = (id) => document.getElementById(id);
+const statusEl = $('status'), connectBtn = $('connectBtn');
+const revokeSection = $('revokeSection'), revokeBtn = $('revokeBtn'), confirmBox = $('confirmBox');
+
+function setStatus(html, cls) {
+  statusEl.className = cls || 'info';
+  statusEl.innerHTML = html;
+}
+function shortAddr(a) { return a.slice(0, 6) + '…' + a.slice(-6); }
+
+function isSolanaWallet(w) {
+  if (!w || !w.features) return false;
+  if (w.features['solana:signTransaction']) return true;
+  return Array.isArray(w.chains) && w.chains.some((c) => typeof c === 'string' && c.indexOf('solana:') === 0);
+}
+
+async function connectWallet() {
+  try {
+    const { getWallets } = await import('@wallet-standard/app');
+    const api = getWallets();
+    let found = api.get().filter(isSolanaWallet);
+    if (!found.length) {
+      await new Promise((resolve) => {
+        const done = () => {
+          window.removeEventListener('wallet-standard:register-wallet', done);
+          resolve();
+        };
+        window.addEventListener('wallet-standard:register-wallet', done);
+        setTimeout(done, 2000);
+      });
+      found = api.get().filter(isSolanaWallet);
+    }
+    const pick = found.find((w) => /coinbase/i.test(w.name || '')) || found[0];
+    if (pick) {
+      const connectFeature = pick.features && pick.features['standard:connect'];
+      const sendFeature = pick.features && pick.features['solana:signAndSendTransaction'];
+      if (!connectFeature) throw new Error('This wallet does not support connect.');
+      if (!sendFeature) throw new Error('This wallet does not support signAndSendTransaction.');
+      const result = await connectFeature.connect({ silent: false });
+      const accounts = result && result.accounts;
+      if (!accounts || !accounts.length) throw new Error('Wallet returned no accounts.');
+      const acct = accounts.find((a) => a.chains && a.chains.some((c) => typeof c === 'string' && c.indexOf('solana:') === 0)) || accounts[0];
+      const pk = new PublicKey(acct.address);
+      return {
+        publicKey: pk,
+        label: pick.name || 'wallet',
+        signAndSend: async (tx) => {
+          const outputs = await sendFeature.signAndSendTransaction({
+            transaction: tx.serialize({ requireAllSignatures: false }),
+            account: acct,
+            chain: 'solana:mainnet',
+          });
+          const sigOut = outputs && outputs[0] && outputs[0].signature;
+          if (typeof sigOut === 'string' && sigOut.length >= 80) return sigOut;
+          if (sigOut && sigOut.length === 64) return bs58.encode(sigOut);
+          throw new Error('Wallet did not return a transaction signature.');
+        },
+      };
+    }
+  } catch (e) {
+    if (e && e.message && /support|accounts/i.test(e.message)) throw e;
+  }
+  const injected = window.coinbaseSolana || window.solana;
+  if (injected && typeof injected.connect === 'function') {
+    await injected.connect();
+    if (!injected.publicKey) throw new Error('Wallet did not return an address.');
+    const pk = new PublicKey(injected.publicKey.toBytes());
+    return {
+      publicKey: pk,
+      label: 'injected wallet',
+      signAndSend: async (tx) => {
+        const res = await injected.signAndSendTransaction(tx);
+        if (typeof res === 'string' && res.length >= 80) return res;
+        const inner = res && res.signature;
+        if (typeof inner === 'string' && inner.length >= 80) return inner;
+        if (inner && inner.length === 64) return bs58.encode(inner);
+        throw new Error('Wallet did not return a transaction signature.');
+      },
+    };
+  }
+  throw new Error('No compatible wallet found on this page. Open this page in your Base App browser (globe icon) and try again.');
+}
+
+// SetAuthority: revoke mint authority. Data = [6, authorityType=0 (MintTokens), 0 (None)].
+function buildRevokeIx() {
+  return new TransactionInstruction({
+    programId: tokenProgramPk,
+    keys: [
+      { pubkey: mintPk, isSigner: false, isWritable: true },
+      { pubkey: authorityPk, isSigner: true, isWritable: false },
+    ],
+    data: Buffer.from([6, 0, 0]),
+  });
+}
+
+function verifyTransaction(tx) {
+  const ixs = tx.instructions;
+  if (ixs.length !== 1) throw new Error('Safety check failed: expected exactly one instruction.');
+  const ix = ixs[0];
+  if (ix.programId.toBase58() !== TOKEN_PROGRAM_ID) throw new Error('Safety check failed: wrong program.');
+  if (ix.data.length !== 3 || ix.data[0] !== 6 || ix.data[1] !== 0 || ix.data[2] !== 0) {
+    throw new Error('Safety check failed: not a mint-authority revocation.');
+  }
+  const k = ix.keys.map((x) => x.pubkey.toBase58());
+  if (k[0] !== MINT) throw new Error('Safety check failed: wrong mint.');
+  if (k[1] !== EXPECTED_AUTHORITY) throw new Error('Safety check failed: wrong authority.');
+  if (!ix.keys[1].isSigner) throw new Error('Safety check failed: authority must sign.');
+}
+
+let wallet = null;
+
+connectBtn.addEventListener('click', async () => {
+  setStatus('Looking for your wallet…', 'info');
+  connectBtn.disabled = true;
+  try {
+    const w = await connectWallet();
+    if (!w.publicKey.equals(authorityPk)) {
+      setStatus(
+        'This is not the mint authority wallet.<br>Connected: <span class="mono">' + w.publicKey.toBase58() + '</span><br>' +
+        'Expected: <span class="mono">' + EXPECTED_AUTHORITY + '</span><br>Please connect the Base App wallet that created PROSP.',
+        'err'
+      );
+      connectBtn.disabled = false;
+      return;
+    }
+    wallet = w;
+    connectBtn.textContent = 'Connected: ' + shortAddr(w.publicKey.toBase58());
+    revokeSection.style.display = 'block';
+    setStatus('Mint authority wallet connected (' + w.label + '). Confirm below to revoke.', 'ok');
+  } catch (e) {
+    setStatus('Could not connect: ' + (e && e.message ? e.message : e), 'err');
+    connectBtn.disabled = false;
+  }
+});
+
+confirmBox.addEventListener('change', () => {
+  revokeBtn.disabled = !confirmBox.checked;
+});
+
+revokeBtn.addEventListener('click', async () => {
+  revokeBtn.disabled = true;
+  try {
+    setStatus('Building transaction… check your wallet to approve.', 'info');
+    const { blockhash } = await connection.getLatestBlockhash();
+    const tx = new Transaction({ recentBlockhash: blockhash, feePayer: wallet.publicKey });
+    tx.add(buildRevokeIx());
+    verifyTransaction(tx);
+    const sig = await wallet.signAndSend(tx);
+    setStatus('Sent. Confirming…<br><span class="mono">' + sig + '</span>', 'info');
+    try {
+      await connection.confirmTransaction(sig, 'confirmed');
+    } catch (e) { /* chain is source of truth */ }
+    setStatus(
+      '<span class="check">✓</span> Mint authority revoked. The 1B PROSP supply is now fixed forever.<br>' +
+      '<a href="https://solscan.io/tx/' + sig + '" target="_blank" rel="noopener">View transaction on Solscan</a>',
+      'ok'
+    );
+    revokeSection.style.display = 'none';
+  } catch (e) {
+    setStatus('Failed: ' + (e && e.message ? e.message : e), 'err');
+    revokeBtn.disabled = !confirmBox.checked;
+  }
+});
+
+window.__moduleReady = true;
+</script>
+</body>
+</html>
