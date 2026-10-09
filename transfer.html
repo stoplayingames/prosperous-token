@@ -52,7 +52,8 @@
   "imports": {
     "buffer": "https://esm.sh/buffer@6.0.3",
     "bs58": "https://esm.sh/bs58@5.0.0",
-    "@solana/web3.js": "https://esm.sh/@solana/web3.js@1.95.8"
+    "@solana/web3.js": "https://esm.sh/@solana/web3.js@1.95.8",
+    "@wallet-standard/app": "https://esm.sh/@wallet-standard/app@1.1.1"
   }
 }
 </script>
@@ -233,31 +234,69 @@ function verifyTransaction(tx, owner, expectedSourceATA, expectedDestATA, expect
   if (transferCount !== 1) throw new Error('Safety check failed: expected exactly one transfer.');
 }
 
-// ---- wallet detection: injected provider first, then Wallet Standard ----
-function getStandardWallets() {
-  const out = [];
-  try {
-    const nav = window.navigator;
-    if (nav && Array.isArray(nav.wallets)) {
-      for (const w of nav.wallets) out.push(w);
-    }
-  } catch (e) { /* ignore */ }
-  for (const w of pendingStandardWallets) out.push(w);
-  return out;
+// ---- wallet detection: Wallet Standard via official app library (same recipe
+// as the working metadata page), then legacy injected providers ----
+function isSolanaWallet(w) {
+  if (!w || !w.features) return false;
+  if (w.features['solana:signTransaction']) return true;
+  return Array.isArray(w.chains) && w.chains.some((c) => typeof c === 'string' && c.indexOf('solana:') === 0);
 }
-const pendingStandardWallets = [];
-window.addEventListener('wallet-standard:register-wallet', (e) => {
-  try {
-    const w = typeof e.detail === 'function' ? e.detail() : e.detail;
-    if (w) pendingStandardWallets.push(w);
-  } catch (err) { /* ignore */ }
-});
-window.addEventListener('wallet-standard:app-ready', () => { /* registry warmed */ });
 
 async function connectWallet() {
-  // 1. Injected provider (e.g. window.coinbaseSolana)
-  const injected = window.coinbaseSolana;
-  if (injected) {
+  // 1. Wallet Standard — detects Coinbase Wallet's mobile dApp browser
+  //    and any other injected wallet-standard provider.
+  try {
+    const { getWallets } = await import('@wallet-standard/app');
+    const api = getWallets();
+    let found = api.get().filter(isSolanaWallet);
+    if (!found.length) {
+      // Wallets can register a beat after page load; wait briefly.
+      await new Promise((resolve) => {
+        const done = () => {
+          window.removeEventListener('wallet-standard:register-wallet', done);
+          resolve();
+        };
+        window.addEventListener('wallet-standard:register-wallet', done);
+        setTimeout(done, 2000);
+      });
+      found = api.get().filter(isSolanaWallet);
+    }
+    const pick = found.find((w) => /coinbase/i.test(w.name || '')) || found[0];
+    if (pick) {
+      const connectFeature = pick.features && pick.features['standard:connect'];
+      const sendFeature = pick.features && pick.features['solana:signAndSendTransaction'];
+      if (!connectFeature) throw new Error('This wallet does not support connect.');
+      if (!sendFeature) throw new Error('This wallet does not support signAndSendTransaction.');
+      const result = await connectFeature.connect({ silent: false });
+      const accounts = result && result.accounts;
+      if (!accounts || !accounts.length) throw new Error('Wallet returned no accounts.');
+      const acct = accounts.find((a) => a.chains && a.chains.some((c) => typeof c === 'string' && c.indexOf('solana:') === 0)) || accounts[0];
+      const pk = new PublicKey(acct.address);
+      return {
+        kind: 'standard',
+        publicKey: pk,
+        label: pick.name || 'wallet',
+        signAndSend: async (tx) => {
+          const outputs = await sendFeature.signAndSendTransaction({
+            transaction: tx.serialize({ requireAllSignatures: false }),
+            account: acct,
+            chain: 'solana:mainnet',
+          });
+          const sigOut = outputs && outputs[0] && outputs[0].signature;
+          if (typeof sigOut === 'string' && sigOut.length >= 80) return sigOut;
+          if (sigOut && sigOut.length === 64) return bs58.encode(sigOut);
+          throw new Error('Wallet did not return a transaction signature.');
+        },
+      };
+    }
+  } catch (e) {
+    if (e && e.message && /support|accounts/i.test(e.message)) throw e;
+    // fall through to legacy injection
+  }
+
+  // 2. Legacy injected provider (older Coinbase Wallet: window.coinbaseSolana).
+  const injected = window.coinbaseSolana || window.solana;
+  if (injected && typeof injected.connect === 'function') {
     await injected.connect();
     if (!injected.publicKey) throw new Error('Wallet did not return an address.');
     const pk = new PublicKey(injected.publicKey.toBytes());
@@ -267,49 +306,15 @@ async function connectWallet() {
       label: 'injected wallet',
       signAndSend: async (tx) => {
         const res = await injected.signAndSendTransaction(tx);
-        const sig = res && res.signature ? res.signature : res;
-        return typeof sig === 'string' ? sig : bs58.encode(sig);
+        if (typeof res === 'string' && res.length >= 80) return res;
+        const inner = res && res.signature;
+        if (typeof inner === 'string' && inner.length >= 80) return inner;
+        if (inner && inner.length === 64) return bs58.encode(inner);
+        throw new Error('Wallet did not return a transaction signature.');
       },
     };
   }
 
-  // 2. Wallet Standard registry — look for the Coinbase / Base wallet
-  // Give late-registering wallets a moment to appear.
-  for (let attempt = 0; attempt < 10; attempt++) {
-    const wallets = getStandardWallets();
-    const match =
-      wallets.find((w) => /coinbase/i.test(w.name || '')) ||
-      wallets.find((w) => /base/i.test(w.name || ''));
-    if (match) {
-      const connectFeature = match.features && match.features['standard:connect'];
-      const sendFeature = match.features && match.features['solana:signAndSendTransaction'];
-      if (!connectFeature) throw new Error('Wallet does not support connecting.');
-      if (!sendFeature) throw new Error('Wallet does not support sending transactions.');
-      await connectFeature.connect();
-      const acct =
-        (match.accounts || []).find((a) => (a.chains || []).includes('solana:mainnet')) ||
-        (match.accounts || [])[0];
-      if (!acct) throw new Error('Wallet returned no accounts.');
-      const pk = new PublicKey(acct.address);
-      return {
-        kind: 'standard',
-        publicKey: pk,
-        label: match.name || 'wallet',
-        signAndSend: async (tx) => {
-          const txBytes = tx.serialize({ requireAllSignatures: false, verifySignatures: false });
-          const out = await sendFeature.signAndSendTransaction({
-            transaction: txBytes,
-            account: acct,
-            chain: 'solana:mainnet',
-          });
-          const raw = Array.isArray(out) ? out[0].signature : out.signature;
-          const bytes = typeof raw === 'string' ? bs58.decode(raw) : raw;
-          return bs58.encode(bytes);
-        },
-      };
-    }
-    await new Promise((r) => setTimeout(r, 300));
-  }
   throw new Error(
     'No compatible wallet found on this page. Open this page in your Base App browser (globe icon) and try again.'
   );
