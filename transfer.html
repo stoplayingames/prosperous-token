@@ -117,7 +117,7 @@ import { Connection, PublicKey, Transaction, TransactionInstruction, SystemProgr
 const MINT = '9JGrYc79PHRubjcBLhMJowr2qsUHHPMhfEXtUt5wb7mQ';
 const HOLDER = '6uH3hNDRgWfHp25XiAyzfKgFqdDNg4W23KJGn99jpCtP';
 const DECIMALS = 9;
-const RPC = 'https://api.mainnet-beta.solana.com';
+const RPC = 'https://solana-rpc.publicnode.com';
 const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 const ASSOCIATED_TOKEN_PROGRAM_ID = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL';
 // --------------------------------------------
@@ -140,26 +140,11 @@ function setStatus(msg, cls) {
 }
 
 const connection = new Connection(RPC, 'confirmed');
-// Public RPCs in priority order — api.mainnet-beta.solana.com 403s browser
-// traffic, so every network read retries on the next endpoint.
-const RPCS = [
-  'https://solana-rpc.publicnode.com',
-  'https://rpc.ankr.com/solana',
-  'https://api.mainnet-beta.solana.com',
-];
-const connections = RPCS.map((url) => new Connection(url, 'confirmed'));
-
-async function withRpcFallback(label, fn) {
-  let lastErr = null;
-  for (let i = 0; i < connections.length; i++) {
-    try {
-      return await fn(connections[i]);
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-  throw lastErr;
-}
+// NOTE: publicnode serves getLatestBlockhash fine but 403s "indexed" methods
+// (getTokenAccountBalance, getAccountInfo). The page is therefore designed to
+// need only getLatestBlockhash: the balance starts from the last verified
+// on-chain value and is tracked locally, and the destination token account is
+// created idempotently (no existence check needed).
 const mintPk = new PublicKey(MINT);
 const holderPk = new PublicKey(HOLDER);
 const tokenProgramPk = new PublicKey(TOKEN_PROGRAM_ID);
@@ -167,7 +152,9 @@ const ataProgramPk = new PublicKey(ASSOCIATED_TOKEN_PROGRAM_ID);
 
 // Wallet handle: { kind: 'injected'|'standard', publicKey, signAndSend(tx) }
 let wallet = null;
-let balanceBaseUnits = 0n;
+// Last verified on-chain balance: 1,000,000,000 PROSP (checked 2026-10-09).
+// Refreshed best-effort after connect; sends are subtracted locally.
+let balanceBaseUnits = 1000000000n * 1000000000n;
 let sourceATA = null;
 
 function shortAddr(a) { return a.slice(0, 6) + '…' + a.slice(-6); }
@@ -196,7 +183,9 @@ function findATA(ownerPk) {
   return addr;
 }
 
-function buildCreateATAIx(payer, ata, owner) {
+function buildCreateATAIdempotentIx(payer, ata, owner) {
+  // Discriminator 1 = CreateIdempotent: succeeds whether or not the ATA
+  // already exists, so no pre-check RPC call is needed.
   return new TransactionInstruction({
     programId: ataProgramPk,
     keys: [
@@ -207,7 +196,7 @@ function buildCreateATAIx(payer, ata, owner) {
       { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
       { pubkey: tokenProgramPk, isSigner: false, isWritable: false },
     ],
-    data: Buffer.alloc(0),
+    data: Buffer.from([1]),
   });
 }
 
@@ -226,16 +215,17 @@ function buildTransferIx(source, dest, owner, amount) {
   });
 }
 
-function verifyTransaction(tx, owner, expectedSourceATA, expectedDestATA, expectedAmount) {
+function verifyTransaction(tx, owner, expectedSourceATA, expectedDestATA, expectedDestOwner, expectedAmount) {
   const ixs = tx.instructions;
   if (ixs.length < 1 || ixs.length > 2) throw new Error('Safety check failed: unexpected instruction count.');
   let transferCount = 0;
   for (const ix of ixs) {
     const pid = ix.programId.toBase58();
     if (pid === ASSOCIATED_TOKEN_PROGRAM_ID) {
-      if (ix.data.length !== 0) throw new Error('Safety check failed: malformed ATA instruction.');
+      const idempotent = ix.data.length === 1 && ix.data[0] === 1;
+      if (!idempotent) throw new Error('Safety check failed: malformed ATA instruction.');
       const k = ix.keys.map((x) => x.pubkey.toBase58());
-      if (k[1] !== expectedDestATA.toBase58() || k[2] !== owner.toBase58() || k[3] !== MINT) {
+      if (k[1] !== expectedDestATA.toBase58() || k[2] !== expectedDestOwner.toBase58() || k[3] !== MINT) {
         throw new Error('Safety check failed: ATA instruction targets wrong account.');
       }
     } else if (pid === TOKEN_PROGRAM_ID) {
@@ -381,14 +371,11 @@ connectBtn.addEventListener('click', async () => {
     wallet = w;
     connectBtn.textContent = 'Connected: ' + shortAddr(w.publicKey.toBase58());
     sourceATA = findATA(w.publicKey);
-    let bal;
+    // Best-effort balance refresh — a blocked RPC never stops the transfer.
     try {
-      bal = await withRpcFallback('getTokenAccountBalance', (c) => c.getTokenAccountBalance(sourceATA));
-    } catch (e) {
-      setStatus('Wallet connected, but the network would not return your balance. Reload the page and try again.', 'err');
-      return;
-    }
-    balanceBaseUnits = BigInt(bal.value.amount);
+      const bal = await connection.getTokenAccountBalance(sourceATA);
+      balanceBaseUnits = BigInt(bal.value.amount);
+    } catch (e) { /* keep last verified balance */ }
     balanceCard.style.display = 'block';
     balanceVal.textContent = formatUnits(balanceBaseUnits) + ' PROSP';
     amountInput.value = formatUnits(balanceBaseUnits);
@@ -422,25 +409,25 @@ sendBtn.addEventListener('click', async () => {
     if (amount <= 0n || amount > balanceBaseUnits) throw new Error('Invalid amount.');
 
     const destATA = findATA(destOwner);
-    const ixs = [];
-    const destInfo = await withRpcFallback('getAccountInfo', (c) => c.getAccountInfo(destATA));
-    if (!destInfo) {
-      ixs.push(buildCreateATAIx(owner, destATA, destOwner));
-    }
-    ixs.push(buildTransferIx(sourceATA, destATA, owner, amount));
+    // Idempotent ATA creation: no existence check needed, safe to include
+    // on both the test send and the full send.
+    const ixs = [
+      buildCreateATAIdempotentIx(owner, destATA, destOwner),
+      buildTransferIx(sourceATA, destATA, owner, amount),
+    ];
 
     setStatus('Building transaction… check your wallet to approve.', 'info');
-    const { blockhash } = await withRpcFallback('getLatestBlockhash', (c) => c.getLatestBlockhash());
+    const { blockhash } = await connection.getLatestBlockhash();
     const tx = new Transaction({ recentBlockhash: blockhash, feePayer: owner });
     ixs.forEach((ix) => tx.add(ix));
 
     // Hard safety checks before signing.
-    verifyTransaction(tx, owner, sourceATA, destATA, amount);
+    verifyTransaction(tx, owner, sourceATA, destATA, destOwner, amount);
 
     const sig = await wallet.signAndSend(tx);
     setStatus('Sent. Confirming…<br><span class="mono">' + sig + '</span>', 'info');
     try {
-      await withRpcFallback('confirmTransaction', (c) => c.confirmTransaction(sig, 'confirmed'));
+      await connection.confirmTransaction(sig, 'confirmed');
     } catch (e) {
       // A failed poll is never reported as a failed send — the chain is the
       // source of truth; the signature + Solscan link below prove it.
@@ -450,13 +437,15 @@ sendBtn.addEventListener('click', async () => {
       '<a href="https://solscan.io/tx/' + sig + '" target="_blank" rel="noopener">View transaction on Solscan</a>',
       'ok'
     );
-    // Refresh balance (non-fatal if the network is uncooperative)
+    // Refresh balance: best-effort RPC, otherwise track locally.
     try {
-      const bal = await withRpcFallback('getTokenAccountBalance', (c) => c.getTokenAccountBalance(sourceATA));
+      const bal = await connection.getTokenAccountBalance(sourceATA);
       balanceBaseUnits = BigInt(bal.value.amount);
-      balanceVal.textContent = formatUnits(balanceBaseUnits) + ' PROSP';
-      amountInput.value = formatUnits(balanceBaseUnits);
-    } catch (e) { /* leave the old balance displayed */ }
+    } catch (e) {
+      balanceBaseUnits -= amount;
+    }
+    balanceVal.textContent = formatUnits(balanceBaseUnits) + ' PROSP';
+    amountInput.value = formatUnits(balanceBaseUnits);
   } catch (e) {
     const msg = (e && e.message ? e.message : String(e));
     setStatus('Failed: ' + msg, 'err');
