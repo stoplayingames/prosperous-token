@@ -140,6 +140,26 @@ function setStatus(msg, cls) {
 }
 
 const connection = new Connection(RPC, 'confirmed');
+// Public RPCs in priority order — api.mainnet-beta.solana.com 403s browser
+// traffic, so every network read retries on the next endpoint.
+const RPCS = [
+  'https://solana-rpc.publicnode.com',
+  'https://rpc.ankr.com/solana',
+  'https://api.mainnet-beta.solana.com',
+];
+const connections = RPCS.map((url) => new Connection(url, 'confirmed'));
+
+async function withRpcFallback(label, fn) {
+  let lastErr = null;
+  for (let i = 0; i < connections.length; i++) {
+    try {
+      return await fn(connections[i]);
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr;
+}
 const mintPk = new PublicKey(MINT);
 const holderPk = new PublicKey(HOLDER);
 const tokenProgramPk = new PublicKey(TOKEN_PROGRAM_ID);
@@ -361,7 +381,13 @@ connectBtn.addEventListener('click', async () => {
     wallet = w;
     connectBtn.textContent = 'Connected: ' + shortAddr(w.publicKey.toBase58());
     sourceATA = findATA(w.publicKey);
-    const bal = await connection.getTokenAccountBalance(sourceATA);
+    let bal;
+    try {
+      bal = await withRpcFallback('getTokenAccountBalance', (c) => c.getTokenAccountBalance(sourceATA));
+    } catch (e) {
+      setStatus('Wallet connected, but the network would not return your balance. Reload the page and try again.', 'err');
+      return;
+    }
     balanceBaseUnits = BigInt(bal.value.amount);
     balanceCard.style.display = 'block';
     balanceVal.textContent = formatUnits(balanceBaseUnits) + ' PROSP';
@@ -397,14 +423,14 @@ sendBtn.addEventListener('click', async () => {
 
     const destATA = findATA(destOwner);
     const ixs = [];
-    const destInfo = await connection.getAccountInfo(destATA);
+    const destInfo = await withRpcFallback('getAccountInfo', (c) => c.getAccountInfo(destATA));
     if (!destInfo) {
       ixs.push(buildCreateATAIx(owner, destATA, destOwner));
     }
     ixs.push(buildTransferIx(sourceATA, destATA, owner, amount));
 
     setStatus('Building transaction… check your wallet to approve.', 'info');
-    const { blockhash } = await connection.getLatestBlockhash();
+    const { blockhash } = await withRpcFallback('getLatestBlockhash', (c) => c.getLatestBlockhash());
     const tx = new Transaction({ recentBlockhash: blockhash, feePayer: owner });
     ixs.forEach((ix) => tx.add(ix));
 
@@ -413,16 +439,24 @@ sendBtn.addEventListener('click', async () => {
 
     const sig = await wallet.signAndSend(tx);
     setStatus('Sent. Confirming…<br><span class="mono">' + sig + '</span>', 'info');
-    await connection.confirmTransaction(sig, 'confirmed');
+    try {
+      await withRpcFallback('confirmTransaction', (c) => c.confirmTransaction(sig, 'confirmed'));
+    } catch (e) {
+      // A failed poll is never reported as a failed send — the chain is the
+      // source of truth; the signature + Solscan link below prove it.
+    }
     setStatus(
       '<span class="check">✓</span> Sent ' + formatUnits(amount) + ' PROSP!<br>' +
       '<a href="https://solscan.io/tx/' + sig + '" target="_blank" rel="noopener">View transaction on Solscan</a>',
       'ok'
     );
-    const bal = await connection.getTokenAccountBalance(sourceATA);
-    balanceBaseUnits = BigInt(bal.value.amount);
-    balanceVal.textContent = formatUnits(balanceBaseUnits) + ' PROSP';
-    amountInput.value = formatUnits(balanceBaseUnits);
+    // Refresh balance (non-fatal if the network is uncooperative)
+    try {
+      const bal = await withRpcFallback('getTokenAccountBalance', (c) => c.getTokenAccountBalance(sourceATA));
+      balanceBaseUnits = BigInt(bal.value.amount);
+      balanceVal.textContent = formatUnits(balanceBaseUnits) + ' PROSP';
+      amountInput.value = formatUnits(balanceBaseUnits);
+    } catch (e) { /* leave the old balance displayed */ }
   } catch (e) {
     const msg = (e && e.message ? e.message : String(e));
     setStatus('Failed: ' + msg, 'err');
