@@ -177,14 +177,19 @@ async function connectWallet() {
   throw new Error('No compatible wallet found. Open this page in your Base App browser.');
 }
 
-// UpdateMetadataAccount (V1): [1, 1, <32-byte new authority>, 0, 0]
-// Sets new update authority, leaves data/primary_sale_happened unchanged.
+// UpdateMetadataAccountV2 (discriminator 15) — the current non-deprecated instruction.
+// Data: [15][01 = Some(update_authority)][32-byte new authority][00 = None(data)][00 = None(primary_sale)][00 = None(is_mutable)]
+// V1 (discriminator 1) is deprecated and returns 0x4b.
 function buildTransferIx(newAuthorityPk) {
+  // UpdateMetadataAccountV2 layout: discriminator, data, newUpdateAuthority, primarySaleHappened, isMutable
+  // data MUST come first (was omitted before — caused invalid instruction)
   const data = Buffer.concat([
-    Buffer.from([1]),
-    Buffer.from([1]),
-    newAuthorityPk.toBuffer(),
-    Buffer.from([0, 0]),
+    Buffer.from([15]),       // discriminator = UpdateMetadataAccountV2
+    Buffer.from([0]),        // data = None (no metadata content change)
+    Buffer.from([1]),        // newUpdateAuthority = Some
+    newAuthorityPk.toBuffer(), // 32-byte new authority pubkey
+    Buffer.from([0]),        // primarySaleHappened = None
+    Buffer.from([0]),        // isMutable = None
   ]);
   return new TransactionInstruction({
     programId: metaplexPk,
